@@ -1,0 +1,7 @@
+priorites.db
+priorites.db-*
+backups/
+*.log
+*.log.*
+__pycache__/
+.claude/
