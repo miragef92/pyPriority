@@ -9,7 +9,8 @@ export const TRASH_DAYS = 30;
 export const DONE_VISIBLE_DAYS = 14;
 export const TOMBSTONE_DAYS = 180;
 export const DEFAULT_PROJECT = { id: "p_default", name: "Perso", color: "#888780", sort: 0 };
-const SETTING_KEYS = { day_start: 2, day_end: 2, calendars: 4000 };
+const SETTING_KEYS = { day_start: 2, day_end: 2, calendars: 4000, calendar_mode: 10 };
+export const CALENDAR_MODES = ["live", "local"];
 
 export class ValidationError extends Error { constructor(m) { super(m); this.name = "ValidationError"; } }
 export class NotFound extends Error { constructor(m) { super(m); this.name = "NotFound"; } }
@@ -328,6 +329,46 @@ export class Store {
   }
 
   // -------- tâches
+  // Sources déjà importées (identifiants Google Agenda), pour éviter les doublons.
+  importedSources() {
+    return new Set(this.all("tasks").map(t => t.source).filter(Boolean));
+  }
+
+  // Import d'événements Google Agenda en tâches, en une seule écriture (tout ou rien).
+  // items : { source, title, planned_date, planned_start, estimate, done, quadrant, project_id, note }
+  async importTasks(items) {
+    if (!Array.isArray(items) || items.length > 5000) throw new ValidationError("Liste d'import invalide.");
+    const known = this.importedSources();
+    const ready = [];
+    for (const it of items) {
+      const source = typeof it?.source === "string" && it.source.length <= 400 ? it.source : null;
+      if (!source) throw new ValidationError("Élément d'import sans identifiant d'origine.");
+      if (known.has(source)) continue;
+      known.add(source);
+      const { source: _, note, ...fields } = it;
+      const f = clean(fields, TASK_V, false);
+      this._checkProject(f.project_id);
+      if (f.planned_start && !f.planned_date) throw new ValidationError("Une heure planifiée nécessite une date planifiée.");
+      this._checkNotPast(f.planned_date, f.done);
+      ready.push({ source, f, note: typeof note === "string" && note.trim() ? note.trim().slice(0, 20000) : null });
+    }
+    if (!ready.length) return { imported: 0, skipped: items.length };
+    const now = nowIso();
+    await this.mutate(w => {
+      ready.forEach(({ source, f, note }, i) => {
+        const id = newId("t");
+        const rec = { title: "", project_id: null, quadrant: 2, due: null, estimate: 30, planned_date: null, planned_start: null,
+          carried_from: null, reports: 0, done: 0, done_at: null, sort: Date.now() / 1000 + i / 1000, created_at: now, updated_at: now,
+          deleted_at: null, source, ...f };
+        if (rec.done) rec.done_at = rec.planned_date ? `${rec.planned_date}T${rec.planned_start || "12:00"}:00` : now;
+        w.put("tasks", id, rec);
+        this._event(w, id, "created", "importée de Google Agenda");
+        if (note) w.put("notes", newId("n"), { task_id: id, body: note, created_at: now, updated_at: null, deleted_at: null, ord: this.clock.fmt() });
+      });
+    });
+    return { imported: ready.length, skipped: items.length - ready.length };
+  }
+
   async createTask(data) {
     const f = clean(data, TASK_V, false);
     this._checkProject(f.project_id);
@@ -457,6 +498,7 @@ export class Store {
     const cur = this.settings();
     const h0 = +(data.day_start ?? cur.day_start ?? 7), h1 = +(data.day_end ?? cur.day_end ?? 21);
     if (!(Number.isInteger(h0) && Number.isInteger(h1) && 0 <= h0 && h0 < h1 && h1 <= 24)) throw new ValidationError("Plage horaire invalide.");
+    if (data.calendar_mode != null && !CALENDAR_MODES.includes(data.calendar_mode)) throw new ValidationError("Mode d'agenda invalide.");
     if (data.calendars) {
       let ok = false;
       try { const v = JSON.parse(data.calendars); ok = Array.isArray(v) && v.every(x => typeof x === "string"); } catch {}
@@ -595,6 +637,7 @@ export class Store {
       "PUT settings": (id, q, b) => this.updateSettings(b),
       "GET export": () => this.exportAll(),
       "POST import": (id, q, b) => this.importData(b),
+      "POST import-tasks": (id, q, b) => this.importTasks(b),
       "POST projects": (id, q, b) => this.createProject(b).then(id => ({ id })),
       "PATCH projects/:id": (id, q, b) => this.updateProject(id, b),
       "DELETE projects/:id": id => this.deleteProject(id),

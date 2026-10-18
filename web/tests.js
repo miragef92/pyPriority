@@ -1,7 +1,7 @@
 // Tests de l'appli web : ouvrir tests.html (servi en local). Aucune donnée réelle n'est touchée.
 import { Store, MemoryAdapter, mergeRecord, canonical, Clock, ValidationError, NotFound, addDays, TOMBSTONE_DAYS } from "./store.js";
 import { Sync, DATA_FILE, FORMAT } from "./sync.js";
-import { bucketEvents } from "./calendar.js";
+import { bucketEvents, eventsToTasks, CalendarService } from "./calendar.js";
 import { NeedsAuth, Offline } from "./google.js";
 
 const results = [];
@@ -422,6 +422,52 @@ await test("agenda : droits de modification, invités, horaires d'origine", () =
   eq([e.d.split, e.a.split], [true, false]);
   eq(new Date(e.d.e) - new Date(e.d.s), 3 * 3600e3, "durée d'origine conservée");
   eq(by["2026-10-13"][0].start, "00:00");
+});
+
+await test("import : événements Google → tâches (passé terminé, durée, note, en cours)", () => {
+  const at = (d, h, m = 0) => new Date(+d.slice(0, 4), +d.slice(5, 7) - 1, +d.slice(8), h, m).toISOString();
+  const tasks = eventsToTasks([
+    { id: "a", summary: "Relire rapport", start: { dateTime: at("2026-10-12", 9) }, end: { dateTime: at("2026-10-12", 10, 30) },
+      description: "<p>Voir <b>courbes</b></p>", location: "Bureau" },
+    { id: "b", summary: "Ancien", start: { dateTime: at("2026-10-01", 14) }, end: { dateTime: at("2026-10-01", 15) } },
+    { id: "c", summary: "Salon", start: { date: "2026-10-08" }, end: { date: "2026-10-12" } },
+    { id: "d", summary: "Refusé", start: { dateTime: at("2026-10-12", 8) }, end: { dateTime: at("2026-10-12", 9) }, attendees: [{ self: true, responseStatus: "declined" }] },
+    { id: "e", summary: "Réunion", recurringEventId: "r", start: { dateTime: at("2026-10-13", 11) }, end: { dateTime: at("2026-10-13", 11, 50) }, attendees: [{ self: true }, { email: "x" }] },
+  ], { calendarId: "cal1", today: DAY });
+  const by = Object.fromEntries(tasks.map(t => [t.title, t]));
+  eq(Object.keys(by).sort(), ["Ancien", "Relire rapport", "Réunion", "Salon"]);
+  eq([by["Relire rapport"].planned_date, by["Relire rapport"].planned_start, by["Relire rapport"].estimate, by["Relire rapport"].done], ["2026-10-12", "09:00", 90, 0]);
+  eq(by["Relire rapport"].note, "Lieu : Bureau\n\nVoir courbes");
+  eq(by["Relire rapport"].source, "gcal:cal1:a");
+  eq(by.Ancien.done, 1);
+  eq([by.Salon.planned_date, by.Salon.planned_start, by.Salon.done], [DAY, null, 0], "événement en cours planifié aujourd'hui");
+  eq([by["Réunion"].recurring, by["Réunion"].guests, by["Réunion"].estimate], [true, 1, 50]);
+});
+
+await test("import : tâches créées en une fois, sans doublon au second import", async () => {
+  const s = await mkStore();
+  const items = [
+    { source: "gcal:c:a", title: "A", planned_date: "2026-10-12", planned_start: "09:00", estimate: 90, done: 0, quadrant: 1, project_id: null, note: "ma note" },
+    { source: "gcal:c:b", title: "B passé", planned_date: "2026-10-01", planned_start: "14:00", estimate: 60, done: 1, quadrant: 2, project_id: null, note: null },
+  ];
+  eq(await s.importTasks(items), { imported: 2, skipped: 0 });
+  eq(await s.importTasks(items), { imported: 0, skipped: 2 });
+  const a = s.all("tasks").find(t => t.title === "A"), b = s.all("tasks").find(t => t.title === "B passé");
+  eq([a.quadrant, a.planned_start, s.notes(a.id)[0].body], [1, "09:00", "ma note"]);
+  eq([b.done, b.done_at], [1, "2026-10-01T14:00:00"]);
+  await throws(() => s.importTasks([{ source: "gcal:c:z", title: "Z", planned_date: "2026-10-01", estimate: 30, done: 0 }]), ValidationError);
+  eq(s.all("tasks").length, 2, "import refusé en entier");
+});
+
+await test("mode « pyPriority seul » : plus aucun événement Google lu", async () => {
+  const s = await mkStore();
+  await s.updateSettings({ calendar_mode: "local" });
+  await throws(() => s.updateSettings({ calendar_mode: "autre" }), ValidationError);
+  let called = false;
+  const fakeGoogle = { enabled: () => true, token: () => ({}), hasCalendar: () => true, events: async () => { called = true; return []; }, calendars: async () => [] };
+  const cal = new CalendarService(s, fakeGoogle);
+  const r = await cal.range(DAY, 3);
+  eq([r.days.length, r.days.every(d => !d.events.length), called], [3, true, false]);
 });
 
 await test("versions de l'appli et du service worker identiques", async () => {

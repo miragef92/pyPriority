@@ -1,9 +1,9 @@
 import { Store, IDBAdapter, ValidationError, NotFound } from "./store.js";
 import { Google } from "./google.js";
 import { Sync } from "./sync.js";
-import { CalendarService } from "./calendar.js";
+import { CalendarService, eventsToTasks } from "./calendar.js";
 
-const APP_VERSION = "1.1.0";
+const APP_VERSION = "1.2.0";
 
 const QUADS = {
   1: { name: "Urgent et important", hint: "Faire", color: "var(--q1)", hex: "#E24B4A" },
@@ -313,7 +313,7 @@ function rangeTitle(days) {
   return `${fa} – ${b.toLocaleDateString("fr-FR", { day: "numeric", month: "long", year: "numeric" })}`;
 }
 
-const calKey = () => (google.enabled() ? "g" : "-") + (S.settings.calendars || "");
+const calKey = () => (google.enabled() ? "g" : "-") + (S.settings.calendars || "") + (S.settings.calendar_mode || "");
 async function loadEvents(days) {
   const key = days[0] + "|" + days.length + "|" + calKey();
   ui.eventsKey = key;
@@ -387,7 +387,7 @@ function renderDay() {
         ${MODES.map(([m, l]) => `<button data-mode="${m}" class="${ui.mode === m ? "on" : ""}">${l}</button>`).join("")}
         ${ui.mode === "custom" ? `<button data-mode="custom" class="on">${ui.customN} jours</button>` : ""}
       </div>
-      <span class="stats">${fmtMin(totTask)} de tâches · ${fmtMin(totMeet)} de réunions${google.enabled() ? "" : ` · <a href="#" id="link-settings">connecter Google Agenda</a>`}</span>
+      <span class="stats">${fmtMin(totTask)} de tâches · ${fmtMin(totMeet)} de réunions${google.enabled() ? (calendar.mode() === "local" ? " · agenda : pyPriority seul" : "") : ` · <a href="#" id="link-settings">connecter Google Agenda</a>`}</span>
     </div>
     ${ui.calWarning ? `<div class="badge danger cal-warning">${esc(ui.calWarning)}</div>` : ""}
     <div class="day">
@@ -994,6 +994,8 @@ async function openSettings() {
     <h3 class="mh">Planning</h3>
     <label>Plage horaire</label>
     <div class="inline" style="align-items:center"><input type="number" id="h0" min="0" max="23" style="width:70px"> h à <input type="number" id="h1" min="1" max="24" style="width:70px"> h</div>
+    <h3 class="mh">Google Agenda</h3>
+    <div id="mode-box" class="gbox"></div>
     <div id="cal-box"></div>
     <h3 class="mh">Données</h3>
     <div class="small muted" id="storage-info">Tes données sont enregistrées dans ce navigateur${google.enabled() ? " et synchronisées dans un dossier caché de ton Google Drive" : ""}.</div>
@@ -1004,7 +1006,7 @@ async function openSettings() {
     <div class="row"><button id="cancel">Fermer</button><button class="primary" id="save">Enregistrer</button></div>`);
   $("#h0", bg).value = S.settings.day_start || 7;
   $("#h1", bg).value = S.settings.day_end || 21;
-  let calendars = null;
+  let calendars = null, mode = calendar.mode();
 
   const drawGoogle = () => {
     const box = $("#g-box", bg);
@@ -1045,9 +1047,22 @@ async function openSettings() {
   };
 
   const drawCalendars = async () => {
-    const box = $("#cal-box", bg);
+    const box = $("#cal-box", bg), mbox = $("#mode-box", bg);
     calendars = null;
-    if (!google.enabled()) { box.innerHTML = ""; return; }
+    if (!google.enabled()) {
+      mbox.innerHTML = `<div class="small muted">Connecte Google pour afficher ton agenda ou l'importer en tâches.</div>`;
+      box.innerHTML = "";
+      return;
+    }
+    mbox.innerHTML = `
+      <label class="radio"><input type="radio" name="cmode" value="live" ${mode === "live" ? "checked" : ""}>
+        <span><b>En direct</b> : le planning affiche Google Agenda, et tes modifications d'événements y sont enregistrées.</span></label>
+      <label class="radio"><input type="radio" name="cmode" value="local" ${mode === "local" ? "checked" : ""}>
+        <span><b>pyPriority seul</b> : Google Agenda n'est plus affiché. Importe une fois ses événements en tâches, puis tout se passe dans pyPriority (synchronisé par Drive).</span></label>
+      <div><button id="cal-import">Importer des événements en tâches…</button></div>`;
+    $$("input[name=cmode]", mbox).forEach(r => r.onchange = () => { mode = r.value; drawCalendars(); });
+    $("#cal-import", mbox).onclick = () => openImport();
+    if (mode === "local") { box.innerHTML = ""; return; }
     box.innerHTML = `<label>Agendas affichés dans le planning</label><div class="cal-list small muted">Chargement…</div>`;
     const list = $(".cal-list", box);
     if (!google.token()) {
@@ -1094,6 +1109,7 @@ async function openSettings() {
   $("#save", bg).onclick = async () => {
     const data = { day_start: String(+$("#h0", bg).value || 0), day_end: String(+$("#h1", bg).value || 24) };
     if (calendars) data.calendars = JSON.stringify($$(".cal-list input:checked", bg).map(i => i.value));
+    if (google.enabled()) data.calendar_mode = mode;
     await api("PUT", "settings", data);
     calendar.invalidate(); ui.eventsKey = null;
     bg.remove(); await load(); toast("Paramètres enregistrés");
@@ -1117,6 +1133,116 @@ async function openSettings() {
       : `Fusion terminée : ${r.changes} élément(s) mis à jour.`);
     await load();
   };
+}
+
+// ---------------------------------------------------------------- import de Google Agenda en tâches
+async function openImport() {
+  const bg = modal(`<h2>Importer Google Agenda en tâches</h2>
+    <div class="small muted">Les événements cochés deviennent des tâches : planifiées à leur date et heure, avec leur durée comme durée estimée,
+      et leur description en note. Les événements passés deviennent des tâches terminées. Google Agenda n'est pas modifié,
+      et un nouvel import ignore ce qui a déjà été importé.</div>
+    <div id="imp-auth"></div>
+    <label for="imp-cal">Agenda</label><select id="imp-cal"><option value="">Chargement…</option></select>
+    <div class="inline wrap" style="align-items:center">Du <input type="date" id="imp-from"> au <input type="date" id="imp-to">
+      <button id="imp-load">Afficher les événements</button></div>
+    <div class="inline wrap" style="align-items:center">
+      <label class="small muted" for="imp-q">Quadrant</label><select id="imp-q">${[1, 2, 3, 4].map(q => `<option value="${q}" ${q === 2 ? "selected" : ""}>${q}. ${QUADS[q].name}</option>`).join("")}</select>
+      <label class="small muted" for="imp-p">Projet</label><select id="imp-p"><option value="">Aucun</option>${S.projects.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}</select></div>
+    <div id="imp-list"></div>
+    <div class="row"><button id="imp-cancel">Annuler</button><button class="primary" id="imp-go">Importer</button></div>`);
+  const $m = sel => $(sel, bg);
+  $m("#imp-from").value = S.today;
+  $m("#imp-to").value = addDays(S.today, 90);
+  $m("#imp-cancel").onclick = () => bg.remove();
+  let candidates = [];
+
+  const loadCalendars = async () => {
+    try {
+      await google.ensureToken({ interactive: true });
+    } catch (e) {
+      $m("#imp-auth").innerHTML = `<div class="badge danger">${esc(e.message)}</div> <button id="imp-reauth">Reconnecter Google</button>`;
+      $m("#imp-reauth").onclick = () => { $m("#imp-auth").innerHTML = ""; loadCalendars(); };
+      return;
+    }
+    try {
+      const cals = await google.calendars();
+      const pref = calendar.selected()[0] || "primary";
+      $m("#imp-cal").innerHTML = cals.map(c => `<option value="${esc(c.id)}" ${c.id === pref ? "selected" : ""}>${esc(c.name)}${c.primary ? " (principal)" : ""}</option>`).join("");
+    } catch (e) { toast(`Liste des agendas indisponible : ${e.message}`, { error: true }); }
+  };
+
+  const updateCount = () => {
+    const n = $$("#imp-list input[data-i]:checked", bg).length;
+    $m("#imp-go").textContent = n ? `Importer ${n} tâche${n > 1 ? "s" : ""}` : "Importer";
+  };
+
+  const drawList = () => {
+    const known = store.importedSources();
+    const fresh = candidates.filter(c => !known.has(c.source));
+    const rows = candidates.map((c, i) => {
+      const done = known.has(c.source);
+      const when = `${dayLabel(c.planned_date)}${c.planned_start ? ` ${c.planned_start}` : ""}`;
+      const tags = [c.allday ? "journée" : fmtMin(c.estimate), c.recurring ? "récurrent" : "", c.guests ? `${c.guests} invité(s)` : "",
+        c.done ? "passé → terminée" : "", done ? "déjà importé" : ""].filter(Boolean).map(t => `<span class="badge info">${esc(t)}</span>`).join(" ");
+      return `<label class="imp-row ${done ? "faint" : ""}"><input type="checkbox" data-i="${i}" ${done ? "disabled" : "checked"}>
+        <span class="imp-when">${esc(when)}</span><span class="imp-title">${esc(c.title)}</span><span class="imp-tags">${tags}</span></label>`;
+    }).join("");
+    $m("#imp-list").innerHTML = candidates.length ? `
+      <div class="small muted">${candidates.length} événement(s), dont ${candidates.length - fresh.length} déjà importé(s).</div>
+      <div class="inline wrap"><button class="ghost" data-sel="all">Tout cocher</button><button class="ghost" data-sel="none">Tout décocher</button>
+        <button class="ghost" data-sel="recurring">Décocher les récurrents</button><button class="ghost" data-sel="guests">Décocher ceux avec invités</button>
+        <button class="ghost" data-sel="past">Décocher les passés</button></div>
+      <div class="imp-rows">${rows}</div>` : `<div class="empty">Aucun événement sur cette période.</div>`;
+    $$("#imp-list [data-sel]", bg).forEach(b => b.onclick = () => {
+      $$("#imp-list input[data-i]:not(:disabled)", bg).forEach(cb => {
+        const c = candidates[+cb.dataset.i];
+        if (b.dataset.sel === "all") cb.checked = true;
+        else if (b.dataset.sel === "none") cb.checked = false;
+        else if (b.dataset.sel === "recurring" && c.recurring) cb.checked = false;
+        else if (b.dataset.sel === "guests" && c.guests) cb.checked = false;
+        else if (b.dataset.sel === "past" && c.done) cb.checked = false;
+      });
+      updateCount();
+    });
+    $$("#imp-list input[data-i]", bg).forEach(cb => cb.onchange = updateCount);
+    updateCount();
+  };
+
+  $m("#imp-load").onclick = async () => {
+    const cal = $m("#imp-cal").value, from = $m("#imp-from").value, to = $m("#imp-to").value;
+    if (!cal) return toast("Choisis un agenda.", { error: true });
+    if (!from || !to || to < from) return toast("Période invalide : la fin doit suivre le début.", { error: true });
+    if (Math.round((parseISO(to) - parseISO(from)) / 864e5) > 731) return toast("Période trop longue : deux ans au maximum.", { error: true });
+    $m("#imp-list").innerHTML = `<div class="small muted">Chargement…</div>`;
+    try {
+      await google.ensureToken({ interactive: true });
+      const items = await google.events(cal, parseISO(from).toISOString(), parseISO(addDays(to, 1)).toISOString());
+      candidates = eventsToTasks(items, { calendarId: cal, today: S.today });
+      drawList();
+    } catch (e) {
+      $m("#imp-list").innerHTML = `<div class="badge danger">${esc(e.message)}</div>`;
+    }
+  };
+
+  $m("#imp-go").onclick = async () => {
+    const quadrant = +$m("#imp-q").value, project_id = $m("#imp-p").value || null;
+    const chosen = $$("#imp-list input[data-i]:checked", bg).map(cb => candidates[+cb.dataset.i]);
+    if (!chosen.length) return toast(candidates.length ? "Coche au moins un événement." : "Affiche d'abord les événements à importer.", { error: true });
+    const items = chosen.map(c => ({ source: c.source, title: c.title, planned_date: c.planned_date, planned_start: c.planned_start,
+      estimate: c.estimate, done: c.done, quadrant, project_id, note: c.note }));
+    const r = await api("POST", "import-tasks", items);
+    toast(`${r.imported} tâche(s) importée(s)${r.skipped ? `, ${r.skipped} déjà présente(s)` : ""}.`);
+    $$(".modal-bg").forEach(m => m.remove());
+    if (calendar.mode() === "live" && r.imported && await confirmModal("Passer en mode « pyPriority seul » ?",
+      "Sinon, ces événements apparaîtront deux fois dans le planning : comme tâches et comme événements Google.", "Passer en mode pyPriority seul")) {
+      await api("PUT", "settings", { calendar_mode: "local" });
+      calendar.invalidate();
+    }
+    ui.eventsKey = null;
+    await load();
+  };
+
+  loadCalendars();
 }
 
 // ---------------------------------------------------------------- indicateur de synchronisation

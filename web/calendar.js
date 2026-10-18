@@ -43,6 +43,46 @@ export function bucketEvents(items, days) {
   return out;
 }
 
+const plain = html => String(html || "").replace(/<br\s*\/?>/gi, "\n").replace(/<\/(p|div|li)>/gi, "\n")
+  .replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+  .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\n{3,}/g, "\n\n").trim();
+
+// Événements Google → tâches candidates pour l'import (aperçu, puis store.importTasks).
+// Les événements passés deviennent des tâches terminées (historique, sans report automatique).
+export function eventsToTasks(items, { calendarId, today }) {
+  const out = [];
+  for (const it of items) {
+    if (!it?.id || it.status === "cancelled" || it.eventType === "workingLocation") continue;
+    if (it.attendees?.some(a => a.self && a.responseStatus === "declined")) continue;
+    const title = (it.summary || "(sans titre)").slice(0, 500);
+    const noteParts = [];
+    if (it.location) noteParts.push(`Lieu : ${it.location}`);
+    if (it.description) noteParts.push(plain(it.description));
+    let planned_date, planned_start = null, estimate, past;
+    if (it.start?.date) {
+      planned_date = it.start.date;
+      estimate = 60;
+      const end = it.end?.date && it.end.date > planned_date ? it.end.date : addDays(planned_date, 1);
+      past = end <= today;
+      if (addDays(planned_date, 1) < end) noteParts.unshift(`Événement sur plusieurs jours, jusqu'au ${addDays(end, -1)}.`);
+      if (!past && planned_date < today) planned_date = today; // en cours : planifié aujourd'hui
+    } else if (it.start?.dateTime) {
+      const s = new Date(it.start.dateTime), e = new Date(it.end?.dateTime || s.getTime() + 3600e3);
+      planned_date = localISO(s);
+      planned_start = `${pad(s.getHours())}:${pad(s.getMinutes())}`;
+      estimate = Math.min(1440, Math.max(5, Math.round((e - s) / 60e3 / 5) * 5 || 5));
+      past = planned_date < today; // même règle que la planification : un jour passé = terminé
+    } else continue;
+    out.push({
+      source: `gcal:${calendarId}:${it.id}`,
+      title, planned_date, planned_start, estimate, done: past ? 1 : 0,
+      note: noteParts.join("\n\n") || null,
+      recurring: !!it.recurringEventId, guests: (it.attendees || []).filter(a => !a.self).length, allday: !!it.start.date,
+    });
+  }
+  return out.sort((a, b) => (a.planned_date + (a.planned_start || "")).localeCompare(b.planned_date + (b.planned_start || "")));
+}
+
 export class CalendarService {
   constructor(store, google) {
     this.store = store;
@@ -50,6 +90,7 @@ export class CalendarService {
     this.mem = new Map();
   }
   invalidate() { this.mem.clear(); }
+  mode() { return this.store.settings().calendar_mode === "local" ? "local" : "live"; }
   selected() {
     try {
       const v = JSON.parse(this.store.settings().calendars ?? '["primary"]');
@@ -60,7 +101,7 @@ export class CalendarService {
   async range(start, n) {
     const days = Array.from({ length: n }, (_, i) => addDays(start, i));
     const result = by => ({ days: days.map(date => ({ date, events: by[date] || [] })) });
-    if (!this.google.enabled()) return { ...result({}), warning: null };
+    if (!this.google.enabled() || this.mode() === "local") return { ...result({}), warning: null };
     const ids = this.selected();
     if (!ids.length) return { ...result({}), warning: null };
     const key = `${days[0]}|${n}|${ids.join(",")}`;

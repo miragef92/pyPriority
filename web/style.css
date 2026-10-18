@@ -261,3 +261,12 @@ kbd { font-family: inherit; font-size: 11px; border: 1px solid var(--line-strong
 .block.event.clickable, .ev-chip.clickable { cursor: pointer; }
 .block.event.clickable:hover, .ev-chip.clickable:hover { border-color: var(--accent); color: var(--text); }
 .block.event[draggable="true"] { cursor: grab; }
+
+label.radio { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; line-height: 1.4; }
+label.radio input { margin-top: 3px; }
+.imp-rows { max-height: 45vh; overflow-y: auto; border: 1px solid var(--line); border-radius: var(--radius); }
+.imp-row { display: grid; grid-template-columns: 20px 130px minmax(0, 1fr); gap: 2px 8px; align-items: center; padding: 6px 8px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.imp-row .imp-when { color: var(--muted); white-space: nowrap; }
+.imp-row .imp-title { overflow-wrap: anywhere; }
+.imp-row .imp-tags { grid-column: 2 / -1; display: flex; gap: 4px; flex-wrap: wrap; }
+@media (max-width: 760px) { .imp-row { grid-template-columns: 20px minmax(0, 1fr); } .imp-row .imp-title { grid-column: 2; } }
