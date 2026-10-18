@@ -3,7 +3,7 @@ import { Google } from "./google.js";
 import { Sync } from "./sync.js";
 import { CalendarService, eventsToTasks } from "./calendar.js";
 
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.3.0";
 
 const QUADS = {
   1: { name: "Urgent et important", hint: "Faire", color: "var(--q1)", hex: "#E24B4A" },
@@ -498,50 +498,155 @@ function bindDayDnD() {
     const id = b.dataset.id;
     b.addEventListener("click", e => { if (!e.target.classList.contains("check") && !e.target.classList.contains("resize")) openTask(id); });
     b.querySelector(".check").addEventListener("change", e => setDone(id, e.target.checked));
-    b.addEventListener("dragstart", e => {
-      if (resizing) return e.preventDefault();
-      e.dataTransfer.setData("text/plain", String(id)); drag.id = id; drag.offset = e.clientY - b.getBoundingClientRect().top;
-      setTimeout(() => b.style.opacity = .3);
-    });
-    b.addEventListener("dragend", () => { b.style.opacity = ""; drag.id = null; drag.offset = 0; clearDropMarks(); });
     b.querySelector(".resize").addEventListener("pointerdown", e => startResize(e, b, id));
   });
   bindEventBlocks();
-  // Tâches : pas de dépôt sur les jours passés (elles seraient aussitôt « reportées »). Événements : partout.
-  $$(".cal .col").forEach(col => {
-    const past = col.classList.contains("past");
-    col.addEventListener("dragover", e => {
-      const ev = drag.ev && !drag.ev.allday ? drag.ev : null;
-      if (!(drag.id && !past) && !ev) return;
-      e.preventDefault();
-      const m = minuteAt(col, e.clientY - drag.offset), pxMin = hourPx() / 60;
-      const t = drag.id ? findTask(drag.id) : null;
-      const minutes = t ? t.estimate : Math.round((new Date(ev.e) - new Date(ev.s)) / 60e3);
-      let g = $(".ghost-block");
-      if (g && g.parentNode !== col) { g.remove(); g = null; }
-      if (!g) { g = document.createElement("div"); g.className = "ghost-block"; col.appendChild(g); }
-      g.style.top = (m - dayRange[0] * 60) * pxMin + "px"; g.style.height = Math.max(18, minutes * pxMin - 2) + "px";
-      g.textContent = `${fromMin(m)}  ${t ? t.title : ev.title}`;
-    });
-    col.addEventListener("dragleave", e => { if (!col.contains(e.relatedTarget)) col.querySelector(".ghost-block")?.remove(); });
-    col.addEventListener("drop", e => {
-      e.preventDefault();
-      const m = minuteAt(col, e.clientY - drag.offset), id = drag.id, ev = drag.ev;
-      clearDropMarks();
-      if (id && !past) patchTask(id, { planned_date: col.dataset.date, planned_start: fromMin(m) });
-      else if (ev && !ev.allday) moveEvent(ev, col.dataset.date, m);
-    });
-  });
-  $$(".cal .ad").forEach(z => {
-    if (!z.classList.contains("past")) bindDropZone(z, () => ({ planned_date: z.dataset.date, planned_start: null }));
-    z.addEventListener("dragover", e => { if (drag.ev?.allday) { e.preventDefault(); z.classList.add("drop-hover"); } });
-    z.addEventListener("drop", e => {
-      if (!drag.ev?.allday) return;
-      e.preventDefault(); const ev = drag.ev; clearDropMarks(); shiftAllDayEvent(ev, z.dataset.date);
-    });
-  });
-  bindDropZone($("#zone-backlog"), () => ({ planned_date: null }));
+  // Dans le planning, le glisser-déposer natif est remplacé par planDrag (souris et tactile).
+  $$("#view-day [draggable]").forEach(el => el.removeAttribute("draggable"));
 }
+
+// ---------------------------------------------------------------- glisser-déposer du planning (souris et doigt)
+// Souris : on attrape après 5 px de déplacement. Doigt : appui long (350 ms) ; un glissement rapide fait défiler.
+const LONG_PRESS = 350;
+let planDrag = null;
+
+function planSource(el) {
+  if (el.matches("[data-ev]")) {
+    const ev = evIndex.get(el.dataset.ev);
+    return ev?.canEdit ? { kind: "event", ev, title: ev.title } : null;
+  }
+  const t = findTask(el.dataset.id);
+  return t && !t.done ? { kind: "task", t, title: t.title } : null;
+}
+
+function planDown(e) {
+  if (planDrag || e.button > 0 || e.target.closest(".check, .resize, button, input, select, a")) return;
+  const el = e.target.closest(".cal .block, .cal .ev-chip, .cal .task.chip, .backlog .task");
+  if (!el) return;
+  const src = planSource(el);
+  if (!src) return;
+  const r = el.getBoundingClientRect();
+  planDrag = { el, src, id: e.pointerId, touch: e.pointerType !== "mouse", x0: e.clientX, y0: e.clientY, x: e.clientX, y: e.clientY,
+    dx: e.clientX - r.left, dy: el.matches(".cal .block") ? e.clientY - r.top : 0, started: false, drop: null };
+  if (planDrag.touch) planDrag.timer = setTimeout(() => planDrag && planStart(), LONG_PRESS);
+  window.addEventListener("pointermove", planMove, { passive: false });
+  window.addEventListener("pointerup", planUp);
+  window.addEventListener("pointercancel", planCancel);
+}
+
+function planStart() {
+  const d = planDrag;
+  d.started = true;
+  const r = d.el.getBoundingClientRect();
+  d.float = d.el.cloneNode(true);
+  d.float.classList.add("drag-float");
+  Object.assign(d.float.style, { width: `${r.width}px`, height: `${Math.min(r.height, 120)}px`, left: "0", top: "0" });
+  document.body.appendChild(d.float);
+  d.el.classList.add("drag-source");
+  document.body.classList.add("plan-dragging");
+  document.addEventListener("touchmove", stopTouchScroll, { passive: false });
+  if (d.touch) navigator.vibrate?.(15);
+  d.scroller = setInterval(planAutoScroll, 30);
+  planUpdate();
+}
+
+function stopTouchScroll(e) { if (planDrag?.started) e.preventDefault(); }
+
+function planMove(e) {
+  const d = planDrag;
+  if (!d || e.pointerId !== d.id) return;
+  d.x = e.clientX; d.y = e.clientY;
+  const dist = Math.hypot(d.x - d.x0, d.y - d.y0);
+  if (!d.started) {
+    if (d.touch) { if (dist > 8) planCancel(); } // l'utilisateur fait défiler
+    else if (dist > 5) planStart();
+    return;
+  }
+  e.preventDefault();
+  planUpdate();
+}
+
+function planAutoScroll() {
+  const d = planDrag, view = $("#view-day");
+  if (!d?.started || !view) return;
+  const r = view.getBoundingClientRect(), edge = 48;
+  const dy = d.y < r.top + edge ? -(r.top + edge - d.y) / 3 : d.y > r.bottom - edge ? (d.y - (r.bottom - edge)) / 3 : 0;
+  const dx = d.x < r.left + edge ? -(r.left + edge - d.x) / 3 : d.x > r.right - edge ? (d.x - (r.right - edge)) / 3 : 0;
+  if (dx || dy) { view.scrollBy(dx, dy); planUpdate(); }
+}
+
+// Cible sous le doigt / curseur, et aperçu calé au quart d'heure.
+function planUpdate() {
+  const d = planDrag;
+  d.float.style.transform = `translate(${d.x - d.dx}px, ${d.y - (d.dy || 12)}px)`;
+  $$(".drop-hover").forEach(x => x.classList.remove("drop-hover"));
+  const under = document.elementFromPoint(d.x, d.y);
+  const target = under?.closest(".cal .col, .cal .ad, #zone-backlog");
+  const { kind, t, ev } = d.src;
+  d.drop = null;
+  let ghost = $(".ghost-block");
+  if (target?.matches(".col") && (kind === "task" ? !target.classList.contains("past") : !ev.allday)) {
+    const m = minuteAt(target, d.y - d.dy), pxMin = hourPx() / 60;
+    const minutes = kind === "task" ? t.estimate : Math.round((new Date(ev.e) - new Date(ev.s)) / 60e3);
+    if (ghost && ghost.parentNode !== target) { ghost.remove(); ghost = null; }
+    if (!ghost) { ghost = document.createElement("div"); ghost.className = "ghost-block"; target.appendChild(ghost); }
+    ghost.style.top = `${(m - dayRange[0] * 60) * pxMin}px`;
+    ghost.style.height = `${Math.max(18, minutes * pxMin - 2)}px`;
+    ghost.textContent = `${fromMin(m)}  ${d.src.title}`;
+    d.drop = { type: "time", date: target.dataset.date, minute: m };
+    return;
+  }
+  ghost?.remove();
+  if (target?.matches(".ad") && (kind === "task" ? !target.classList.contains("past") : ev.allday)) {
+    target.classList.add("drop-hover");
+    d.drop = { type: "day", date: target.dataset.date };
+  } else if (target?.matches("#zone-backlog") && kind === "task") {
+    target.classList.add("drop-hover");
+    d.drop = { type: "backlog" };
+  }
+}
+
+function planEnd() {
+  const d = planDrag;
+  planDrag = null;
+  clearTimeout(d.timer);
+  clearInterval(d.scroller);
+  window.removeEventListener("pointermove", planMove);
+  window.removeEventListener("pointerup", planUp);
+  window.removeEventListener("pointercancel", planCancel);
+  document.removeEventListener("touchmove", stopTouchScroll);
+  document.body.classList.remove("plan-dragging");
+  d.float?.remove();
+  d.el.classList.remove("drag-source");
+  clearDropMarks();
+  if (d.started) {
+    // le clic qui suit un glisser ne doit pas ouvrir la fiche
+    const swallow = e => { e.stopPropagation(); e.preventDefault(); };
+    window.addEventListener("click", swallow, { capture: true, once: true });
+    setTimeout(() => window.removeEventListener("click", swallow, { capture: true }), 400);
+  }
+  return d;
+}
+function planCancel() { if (planDrag) planEnd(); }
+
+function planUp(e) {
+  if (!planDrag || e.pointerId !== planDrag.id) return;
+  const d = planEnd();
+  if (!d.started || !d.drop) return;
+  const { kind, t, ev } = d.src, drop = d.drop;
+  if (kind === "task") {
+    if (drop.type === "time") {
+      const start = fromMin(drop.minute);
+      if (t.planned_date !== drop.date || t.planned_start !== start) patchTask(t.id, { planned_date: drop.date, planned_start: start });
+    } else if (drop.type === "day") {
+      if (t.planned_date !== drop.date || t.planned_start) patchTask(t.id, { planned_date: drop.date, planned_start: null });
+    } else if (t.planned_date) patchTask(t.id, { planned_date: null });
+  } else if (drop.type === "time") moveEvent(ev, drop.date, drop.minute);
+  else if (drop.type === "day") shiftAllDayEvent(ev, drop.date);
+}
+
+$("#view-day").addEventListener("pointerdown", planDown);
+$("#view-day").addEventListener("contextmenu", e => { if (e.target.closest(".cal .block, .cal .ev-chip, .task")) e.preventDefault(); });
 let resizing = false;
 function startResize(e, block, id) {
   e.preventDefault(); e.stopPropagation(); resizing = true; block.draggable = false;
@@ -550,7 +655,7 @@ function startResize(e, block, id) {
   const move = ev => { est = Math.min(1440, Math.max(SNAP, Math.round((startH + ev.clientY - startY) / pxMin / SNAP) * SNAP)); block.style.height = est * pxMin - 2 + "px"; };
   const up = () => {
     window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); resizing = false;
-    if (est !== t.estimate) patchTask(id, { estimate: est }); else block.draggable = true;
+    if (est !== t.estimate) patchTask(id, { estimate: est });
   };
   window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
 }
@@ -570,13 +675,6 @@ function bindEventBlocks() {
     if (!ev) return;
     el.addEventListener("click", e => { if (!e.target.classList.contains("resize")) openEvent(ev); });
     if (!ev.canEdit) return;
-    el.addEventListener("dragstart", e => {
-      if (resizing) return e.preventDefault();
-      e.dataTransfer.setData("text/plain", ev.title); drag.ev = ev; drag.id = null;
-      drag.offset = ev.allday ? 0 : e.clientY - el.getBoundingClientRect().top;
-      setTimeout(() => el.style.opacity = .3);
-    });
-    el.addEventListener("dragend", () => { el.style.opacity = ""; drag.ev = null; drag.offset = 0; clearDropMarks(); });
     el.querySelector(".resize")?.addEventListener("pointerdown", e => resizeEvent(e, el, ev));
   });
 }
@@ -644,7 +742,7 @@ function resizeEvent(e, block, ev) {
   const move = m => { dur = Math.min(1440, Math.max(SNAP, Math.round((startH + m.clientY - startY) / pxMin / SNAP) * SNAP)); block.style.height = dur * pxMin - 2 + "px"; };
   const up = () => {
     window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); resizing = false;
-    if (dur === dur0) { block.draggable = true; return; }
+    if (dur === dur0) return;
     const end = new Date(new Date(ev.s).getTime() + dur * 60e3);
     saveEvent(ev, { end: at(end) }, { undo: { end: at(new Date(ev.e)) }, message: `« ${ev.title} » : fin à ${hhmm(end)}` });
   };
@@ -1059,9 +1157,11 @@ async function openSettings() {
         <span><b>En direct</b> : le planning affiche Google Agenda, et tes modifications d'événements y sont enregistrées.</span></label>
       <label class="radio"><input type="radio" name="cmode" value="local" ${mode === "local" ? "checked" : ""}>
         <span><b>pyPriority seul</b> : Google Agenda n'est plus affiché. Importe une fois ses événements en tâches, puis tout se passe dans pyPriority (synchronisé par Drive).</span></label>
-      <div><button id="cal-import">Importer des événements en tâches…</button></div>`;
+      <div class="inline wrap"><button id="cal-import">Importer des événements en tâches…</button>
+        <button class="ghost danger" id="cal-unimport">Supprimer les tâches importées…</button></div>`;
     $$("input[name=cmode]", mbox).forEach(r => r.onchange = () => { mode = r.value; drawCalendars(); });
     $("#cal-import", mbox).onclick = () => openImport();
+    $("#cal-unimport", mbox).onclick = () => openDeleteImported();
     if (mode === "local") { box.innerHTML = ""; return; }
     box.innerHTML = `<label>Agendas affichés dans le planning</label><div class="cal-list small muted">Chargement…</div>`;
     const list = $(".cal-list", box);
@@ -1148,6 +1248,8 @@ async function openImport() {
     <div class="inline wrap" style="align-items:center">
       <label class="small muted" for="imp-q">Quadrant</label><select id="imp-q">${[1, 2, 3, 4].map(q => `<option value="${q}" ${q === 2 ? "selected" : ""}>${q}. ${QUADS[q].name}</option>`).join("")}</select>
       <label class="small muted" for="imp-p">Projet</label><select id="imp-p"><option value="">Aucun</option>${S.projects.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join("")}</select></div>
+    <label class="toggle small"><input type="checkbox" id="imp-update" checked> Mettre à jour les tâches déjà importées que je n'ai pas modifiées
+      (nouvelle date, heure, titre ou durée)</label>
     <div id="imp-list"></div>
     <div class="row"><button id="imp-cancel">Annuler</button><button class="primary" id="imp-go">Importer</button></div>`);
   const $m = sel => $(sel, bg);
@@ -1177,18 +1279,20 @@ async function openImport() {
   };
 
   const drawList = () => {
-    const known = store.importedSources();
+    const known = store.importedTasks(), update = $m("#imp-update").checked;
     const fresh = candidates.filter(c => !known.has(c.source));
     const rows = candidates.map((c, i) => {
-      const done = known.has(c.source);
+      const old = known.get(c.source), done = !!old;
+      const state = !old ? "" : update && !wasModified(old) ? "sera mise à jour" : "déjà importée, gardée telle quelle";
       const when = `${dayLabel(c.planned_date)}${c.planned_start ? ` ${c.planned_start}` : ""}`;
       const tags = [c.allday ? "journée" : fmtMin(c.estimate), c.recurring ? "récurrent" : "", c.guests ? `${c.guests} invité(s)` : "",
-        c.done ? "passé → terminée" : "", done ? "déjà importé" : ""].filter(Boolean).map(t => `<span class="badge info">${esc(t)}</span>`).join(" ");
-      return `<label class="imp-row ${done ? "faint" : ""}"><input type="checkbox" data-i="${i}" ${done ? "disabled" : "checked"}>
+        c.done ? "passé → terminée" : "", state].filter(Boolean).map(t => `<span class="badge info">${esc(t)}</span>`).join(" ");
+      const locked = done && !(update && !wasModified(old));
+      return `<label class="imp-row ${locked ? "faint" : ""}"><input type="checkbox" data-i="${i}" ${locked ? "disabled" : "checked"}>
         <span class="imp-when">${esc(when)}</span><span class="imp-title">${esc(c.title)}</span><span class="imp-tags">${tags}</span></label>`;
     }).join("");
     $m("#imp-list").innerHTML = candidates.length ? `
-      <div class="small muted">${candidates.length} événement(s), dont ${candidates.length - fresh.length} déjà importé(s).</div>
+      <div class="small muted">${candidates.length} événement(s) : ${fresh.length} nouveau(x), ${candidates.length - fresh.length} déjà importé(s).</div>
       <div class="inline wrap"><button class="ghost" data-sel="all">Tout cocher</button><button class="ghost" data-sel="none">Tout décocher</button>
         <button class="ghost" data-sel="recurring">Décocher les récurrents</button><button class="ghost" data-sel="guests">Décocher ceux avec invités</button>
         <button class="ghost" data-sel="past">Décocher les passés</button></div>
@@ -1208,6 +1312,7 @@ async function openImport() {
     updateCount();
   };
 
+  $m("#imp-update").onchange = () => { if (candidates.length) drawList(); };
   $m("#imp-load").onclick = async () => {
     const cal = $m("#imp-cal").value, from = $m("#imp-from").value, to = $m("#imp-to").value;
     if (!cal) return toast("Choisis un agenda.", { error: true });
@@ -1230,8 +1335,9 @@ async function openImport() {
     if (!chosen.length) return toast(candidates.length ? "Coche au moins un événement." : "Affiche d'abord les événements à importer.", { error: true });
     const items = chosen.map(c => ({ source: c.source, title: c.title, planned_date: c.planned_date, planned_start: c.planned_start,
       estimate: c.estimate, done: c.done, quadrant, project_id, note: c.note }));
-    const r = await api("POST", "import-tasks", items);
-    toast(`${r.imported} tâche(s) importée(s)${r.skipped ? `, ${r.skipped} déjà présente(s)` : ""}.`);
+    const r = await api("POST", "import-tasks", { items, update: $m("#imp-update").checked });
+    toast([`${r.imported} tâche(s) importée(s)`, r.updated ? `${r.updated} mise(s) à jour` : "", r.skipped ? `${r.skipped} inchangée(s)` : ""]
+      .filter(Boolean).join(", ") + ".");
     $$(".modal-bg").forEach(m => m.remove());
     if (calendar.mode() === "live" && r.imported && await confirmModal("Passer en mode « pyPriority seul » ?",
       "Sinon, ces événements apparaîtront deux fois dans le planning : comme tâches et comme événements Google.", "Passer en mode pyPriority seul")) {
@@ -1243,6 +1349,32 @@ async function openImport() {
   };
 
   loadCalendars();
+}
+
+const wasModified = t => !!t.touched;
+
+// Met à la corbeille les tâches importées de Google Agenda (pour repartir d'un import propre).
+function openDeleteImported() {
+  const all = [...store.importedTasks().values()];
+  if (!all.length) return toast("Aucune tâche importée de Google Agenda.");
+  const modified = all.filter(wasModified).length, done = all.filter(t => t.done).length;
+  const bg = modal(`<h2>Supprimer les tâches importées</h2>
+    <div class="muted">${all.length} tâche(s) viennent de Google Agenda, dont ${modified} modifiée(s) depuis l'import et ${done} terminée(s).
+      Elles iront à la corbeille (récupérables 30 jours).</div>
+    <label class="toggle"><input type="checkbox" id="di-mod" checked> Garder celles que j'ai modifiées</label>
+    <label class="toggle"><input type="checkbox" id="di-done"> Garder les tâches terminées</label>
+    <div class="row"><button id="di-cancel">Annuler</button><button class="primary" id="di-go">Mettre à la corbeille</button></div>`);
+  const count = () => all.filter(t => !($("#di-mod", bg).checked && wasModified(t)) && !($("#di-done", bg).checked && t.done)).length;
+  const label = () => { const n = count(); $("#di-go", bg).textContent = `Mettre ${n} tâche${n > 1 ? "s" : ""} à la corbeille`; };
+  $("#di-mod", bg).onchange = label; $("#di-done", bg).onchange = label; label();
+  $("#di-cancel", bg).onclick = () => bg.remove();
+  $("#di-go", bg).onclick = async () => {
+    if (!count()) return toast("Aucune tâche ne correspond.", { error: true });
+    const r = await api("POST", "delete-imported", { keepModified: $("#di-mod", bg).checked, keepDone: $("#di-done", bg).checked });
+    $$(".modal-bg").forEach(m => m.remove());
+    await load();
+    toast(`${r.ids.length} tâche(s) importée(s) mise(s) à la corbeille`, { undo: () => api("POST", "restore-tasks", { ids: r.ids }) });
+  };
 }
 
 // ---------------------------------------------------------------- indicateur de synchronisation
@@ -1392,7 +1524,7 @@ if (!["1", "3", "7", "custom"].includes(ui.mode)) ui.mode = "1";
 ui.customN = Math.min(MAX_DAYS, Math.max(2, ui.customN));
 
 // Rechargement au retour sur l'onglet, passage à minuit, rafraîchissement du planning.
-const busy = () => drag.id || drag.ev || resizing || miniSel || $(".modal-bg") || /TEXTAREA|INPUT/.test(document.activeElement?.tagName) && document.activeElement.closest(".note");
+const busy = () => drag.id || drag.ev || planDrag || resizing || miniSel || $(".modal-bg") || /TEXTAREA|INPUT/.test(document.activeElement?.tagName) && document.activeElement.closest(".note");
 window.addEventListener("focus", () => { if (store && !busy()) load().catch(() => {}); });
 setInterval(() => {
   if (!store || busy()) return;

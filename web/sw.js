@@ -1,6 +1,6 @@
 // Service worker : l'appli fonctionne hors ligne. Les fichiers sont mis en cache par version :
 // à chaque modification de l'appli, augmenter VERSION (et APP_VERSION dans app.js).
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 const CACHE = `pypriority-${VERSION}`;
 const SHELL = [
   "./", "index.html", "style.css", "app.js", "store.js", "sync.js", "google.js", "calendar.js", "config.js",

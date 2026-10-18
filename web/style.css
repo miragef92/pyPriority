@@ -270,3 +270,13 @@ label.radio input { margin-top: 3px; }
 .imp-row .imp-title { overflow-wrap: anywhere; }
 .imp-row .imp-tags { grid-column: 2 / -1; display: flex; gap: 4px; flex-wrap: wrap; }
 @media (max-width: 760px) { .imp-row { grid-template-columns: 20px minmax(0, 1fr); } .imp-row .imp-title { grid-column: 2; } }
+
+/* glisser-déposer du planning */
+#view-day .cal .block, #view-day .cal .ev-chip, #view-day .task { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+#view-day .cal .block.event[data-ev] { cursor: grab; }
+.drag-float { position: fixed; z-index: 100; pointer-events: none; opacity: .9; box-shadow: 0 8px 24px rgba(0,0,0,.25);
+  border-radius: 6px; overflow: hidden; margin: 0; }
+.drag-source { opacity: .3; }
+body.plan-dragging, body.plan-dragging * { cursor: grabbing !important; }
+.block .resize { touch-action: none; }
+@media (pointer: coarse) { .block .resize { height: 14px; } }

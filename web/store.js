@@ -329,44 +329,87 @@ export class Store {
   }
 
   // -------- tâches
-  // Sources déjà importées (identifiants Google Agenda), pour éviter les doublons.
-  importedSources() {
-    return new Set(this.all("tasks").map(t => t.source).filter(Boolean));
+  // Tâches importées encore présentes (hors corbeille), par identifiant d'origine.
+  importedTasks() {
+    return new Map(this.all("tasks").filter(t => t.source && !t.deleted_at).map(t => [t.source, t]));
   }
+  importedSources() { return new Set(this.importedTasks().keys()); }
+  // « Modifiée » = changée par l'utilisateur depuis l'import (marqueur posé par updateTask ; reports et mises à jour d'import exclus).
+  static wasModified(t) { return !!t.touched; }
 
   // Import d'événements Google Agenda en tâches, en une seule écriture (tout ou rien).
   // items : { source, title, planned_date, planned_start, estimate, done, quadrant, project_id, note }
-  async importTasks(items) {
+  // update : les tâches déjà importées et non modifiées sont mises à jour (date, heure, titre, durée).
+  async importTasks(items, { update = false } = {}) {
     if (!Array.isArray(items) || items.length > 5000) throw new ValidationError("Liste d'import invalide.");
-    const known = this.importedSources();
-    const ready = [];
+    const existing = this.importedTasks(), seen = new Set();
+    const create = [], refresh = [];
+    let skipped = 0;
     for (const it of items) {
       const source = typeof it?.source === "string" && it.source.length <= 400 ? it.source : null;
       if (!source) throw new ValidationError("Élément d'import sans identifiant d'origine.");
-      if (known.has(source)) continue;
-      known.add(source);
+      if (seen.has(source)) { skipped++; continue; }
+      seen.add(source);
       const { source: _, note, ...fields } = it;
       const f = clean(fields, TASK_V, false);
       this._checkProject(f.project_id);
       if (f.planned_start && !f.planned_date) throw new ValidationError("Une heure planifiée nécessite une date planifiée.");
       this._checkNotPast(f.planned_date, f.done);
-      ready.push({ source, f, note: typeof note === "string" && note.trim() ? note.trim().slice(0, 20000) : null });
+      const old = existing.get(source);
+      if (old) {
+        if (update && !Store.wasModified(old)) refresh.push({ old, f });
+        else skipped++;
+        continue;
+      }
+      create.push({ source, f, note: typeof note === "string" && note.trim() ? note.trim().slice(0, 20000) : null });
     }
-    if (!ready.length) return { imported: 0, skipped: items.length };
+    if (!create.length && !refresh.length) return { imported: 0, updated: 0, skipped };
     const now = nowIso();
+    const doneAt = f => (f.planned_date ? `${f.planned_date}T${f.planned_start || "12:00"}:00` : now);
+    let updated = 0;
     await this.mutate(w => {
-      ready.forEach(({ source, f, note }, i) => {
+      create.forEach(({ source, f, note }, i) => {
         const id = newId("t");
         const rec = { title: "", project_id: null, quadrant: 2, due: null, estimate: 30, planned_date: null, planned_start: null,
           carried_from: null, reports: 0, done: 0, done_at: null, sort: Date.now() / 1000 + i / 1000, created_at: now, updated_at: now,
           deleted_at: null, source, ...f };
-        if (rec.done) rec.done_at = rec.planned_date ? `${rec.planned_date}T${rec.planned_start || "12:00"}:00` : now;
+        if (rec.done) rec.done_at = doneAt(rec);
         w.put("tasks", id, rec);
         this._event(w, id, "created", "importée de Google Agenda");
         if (note) w.put("notes", newId("n"), { task_id: id, body: note, created_at: now, updated_at: null, deleted_at: null, ord: this.clock.fmt() });
       });
+      for (const { old, f } of refresh) {
+        // le quadrant et le projet choisis par l'utilisateur sont conservés ; la tâche reste « non modifiée »
+        const patch = { title: f.title, planned_date: f.planned_date, planned_start: f.planned_start, estimate: f.estimate,
+          done: f.done, done_at: f.done ? (old.done_at || doneAt(f)) : null, carried_from: f.planned_date ? null : old.carried_from };
+        const changed = Object.entries(patch).some(([k, v]) => old[k] !== v);
+        if (!changed) continue;
+        w.put("tasks", old.id, patch);
+        this._event(w, old.id, "planned", "mise à jour depuis Google Agenda");
+        updated++;
+      }
     });
-    return { imported: ready.length, skipped: items.length - ready.length };
+    return { imported: create.length, updated, skipped: skipped + refresh.length - updated };
+  }
+
+  // Met à la corbeille les tâches importées (récupérables). Renvoie les identifiants, pour « Annuler ».
+  async deleteImported({ keepModified = true, keepDone = false } = {}) {
+    const targets = [...this.importedTasks().values()]
+      .filter(t => !(keepModified && Store.wasModified(t)) && !(keepDone && t.done));
+    if (!targets.length) return { ids: [] };
+    const now = nowIso();
+    await this.mutate(w => {
+      for (const t of targets) { w.put("tasks", t.id, { deleted_at: now }); this._event(w, t.id, "deleted"); }
+    });
+    return { ids: targets.map(t => t.id) };
+  }
+  async restoreTasks(ids) {
+    if (!Array.isArray(ids)) throw new ValidationError("Liste invalide.");
+    const list = ids.map(id => this.get("tasks", id)).filter(t => t?.deleted_at);
+    await this.mutate(w => {
+      for (const t of list) { w.put("tasks", t.id, { deleted_at: null }); this._event(w, t.id, "restored"); }
+    });
+    return { restored: list.length };
   }
 
   async createTask(data) {
@@ -408,7 +451,7 @@ export class Store {
         plan.planned_date ? this._event(w, id, "planned", planLabel(plan)) : this._event(w, id, "unplanned");
       if ("quadrant" in f && f.quadrant !== old.quadrant) this._event(w, id, "quadrant", `${old.quadrant}→${f.quadrant}`);
       if ("title" in f && f.title !== old.title) this._event(w, id, "renamed", old.title);
-      w.put("tasks", id, { ...f, updated_at: nowIso() });
+      w.put("tasks", id, { ...f, updated_at: nowIso(), ...(old.source ? { touched: 1 } : {}) });
     });
   }
 
@@ -637,7 +680,9 @@ export class Store {
       "PUT settings": (id, q, b) => this.updateSettings(b),
       "GET export": () => this.exportAll(),
       "POST import": (id, q, b) => this.importData(b),
-      "POST import-tasks": (id, q, b) => this.importTasks(b),
+      "POST import-tasks": (id, q, b) => this.importTasks(b?.items, { update: !!b?.update }),
+      "POST delete-imported": (id, q, b) => this.deleteImported(b || {}),
+      "POST restore-tasks": (id, q, b) => this.restoreTasks(b?.ids),
       "POST projects": (id, q, b) => this.createProject(b).then(id => ({ id })),
       "PATCH projects/:id": (id, q, b) => this.updateProject(id, b),
       "DELETE projects/:id": id => this.deleteProject(id),

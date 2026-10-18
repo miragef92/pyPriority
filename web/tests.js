@@ -25,6 +25,7 @@ async function throws(fn, cls, re) {
 let DAY = "2026-10-10";
 const mkStore = async (adapter = new MemoryAdapter()) => new Store(adapter, { today: () => DAY }).open();
 const task = (s, extra = {}) => s.createTask({ title: "T", ...extra });
+const wasModifiedForTest = t => !!t.touched;
 const view = s => { const snap = s.snapshot(); return canonical(snap); };
 
 // Faux Google Drive partagé entre plusieurs « appareils ».
@@ -450,13 +451,45 @@ await test("import : tâches créées en une fois, sans doublon au second import
     { source: "gcal:c:a", title: "A", planned_date: "2026-10-12", planned_start: "09:00", estimate: 90, done: 0, quadrant: 1, project_id: null, note: "ma note" },
     { source: "gcal:c:b", title: "B passé", planned_date: "2026-10-01", planned_start: "14:00", estimate: 60, done: 1, quadrant: 2, project_id: null, note: null },
   ];
-  eq(await s.importTasks(items), { imported: 2, skipped: 0 });
-  eq(await s.importTasks(items), { imported: 0, skipped: 2 });
+  eq(await s.importTasks(items), { imported: 2, updated: 0, skipped: 0 });
+  eq(await s.importTasks(items), { imported: 0, updated: 0, skipped: 2 });
   const a = s.all("tasks").find(t => t.title === "A"), b = s.all("tasks").find(t => t.title === "B passé");
   eq([a.quadrant, a.planned_start, s.notes(a.id)[0].body], [1, "09:00", "ma note"]);
   eq([b.done, b.done_at], [1, "2026-10-01T14:00:00"]);
   await throws(() => s.importTasks([{ source: "gcal:c:z", title: "Z", planned_date: "2026-10-01", estimate: 30, done: 0 }]), ValidationError);
   eq(s.all("tasks").length, 2, "import refusé en entier");
+});
+
+await test("réimport : met à jour les tâches non modifiées, garde les autres", async () => {
+  const s = await mkStore();
+  const mk = (id, extra = {}) => ({ source: `gcal:c:${id}`, title: id, planned_date: "2026-10-12", planned_start: "09:00", estimate: 30, done: 0, quadrant: 2, project_id: null, note: null, ...extra });
+  await s.importTasks([mk("a"), mk("b")]);
+  const tb = s.all("tasks").find(t => t.title === "b");
+  await s.updateTask(tb.id, { quadrant: 1 });               // modifiée par l'utilisateur
+  const ta = s.all("tasks").find(t => t.title === "a");
+  const r = await s.importTasks([mk("a", { planned_start: "14:00", title: "a v2" }), mk("b", { planned_start: "15:00" }), mk("c")], { update: true });
+  eq([r.imported, r.updated, r.skipped], [1, 1, 1]);
+  const a2 = s.get("tasks", ta.id), b2 = s.get("tasks", tb.id);
+  eq([a2.title, a2.planned_start], ["a v2", "14:00"]);
+  eq([b2.planned_start, b2.quadrant], ["09:00", 1], "tâche modifiée laissée intacte");
+  ok(!wasModifiedForTest(a2), "toujours considérée comme non modifiée");
+  eq((await s.importTasks([mk("a", { planned_start: "16:00" })])).updated, 0, "sans l'option, pas de mise à jour");
+});
+
+await test("supprimer les tâches importées : corbeille, options, annulation, réimport possible", async () => {
+  const s = await mkStore();
+  const mk = (id, extra = {}) => ({ source: `gcal:c:${id}`, title: id, planned_date: "2026-10-12", estimate: 30, done: 0, quadrant: 2, project_id: null, ...extra });
+  await s.importTasks([mk("a"), mk("b"), mk("old", { planned_date: "2026-10-01", done: 1 })]);
+  const perso = await task(s, { title: "perso" });
+  await s.updateTask(s.all("tasks").find(t => t.title === "b").id, { title: "b modifiée" });
+  let r = await s.deleteImported({ keepModified: true, keepDone: true });
+  eq(r.ids.length, 1);
+  eq(s.all("tasks").filter(t => !t.deleted_at).map(t => t.title).sort(), ["b modifiée", "old", "perso"]);
+  await s.restoreTasks(r.ids);
+  r = await s.deleteImported({ keepModified: false });
+  eq(r.ids.length, 3);
+  ok(!s.get("tasks", perso).deleted_at, "tâches non importées jamais touchées");
+  eq((await s.importTasks([mk("a")])).imported, 1, "réimport possible après suppression");
 });
 
 await test("mode « pyPriority seul » : plus aucun événement Google lu", async () => {
